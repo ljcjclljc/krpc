@@ -1,0 +1,7 @@
+function(rpc_apply_project_options)
+    if(MSVC)
+        add_compile_options(/W4 /permissive- /utf-8)
+    else()
+        add_compile_options(-Wall -Wextra -Wpedantic)
+    endif()
+endfunction()
