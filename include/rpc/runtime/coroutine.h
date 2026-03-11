@@ -8,10 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-
-#if !defined(_WIN32)
-#include <ucontext.h>
-#endif
+#include <boost/context/fiber.hpp>
+#include <boost/context/fixedsize_stack.hpp>
 
 namespace rpc::runtime {
 
@@ -71,8 +69,11 @@ public:
     static void yield_current();
 
 private:
-    // 协程入口函数（用于底层上下文 API 回调）。
-    static void entry(void* raw_ptr);
+    // 在首次 resume 时惰性创建 fiber，避免跨线程创建/执行导致上下文断言失败。
+    void ensure_fiber_initialized();
+
+    // Boost.Context 协程入口，负责接收 caller fiber 并执行 run()。
+    static boost::context::fiber fiber_entry(boost::context::fiber&& caller, Coroutine* self);
 
     // 执行用户回调并统一收口生命周期。
     void run();
@@ -82,16 +83,12 @@ private:
     CoroutineCallback callback_;
     // W3 起状态字段改为原子，避免多线程调度下读取/写入数据竞争。
     std::atomic<CoroutineState> state_;
-#if defined(_WIN32)
-    // Windows 使用 Fiber 保存协程上下文。
-    void* fiber_{nullptr};
-#else
-    // POSIX 使用 ucontext 保存协程上下文与栈信息。
-    ucontext_t context_{};
-    ucontext_t* caller_context_{nullptr};
-    std::size_t stack_size_{0};
-    char* stack_{nullptr};
-#endif
+    // 记录协程栈大小，在首次 resume() 时用于构建 fiber。
+    std::size_t stack_size_{kDefaultStackSize};
+    // Boost fiber 对象；每次 resume() 后都要回写返回值到该句柄。
+    boost::context::fiber fiber_{};
+    // caller fiber 由 boost 在入口传入，yield() 通过它切回调度方。
+    boost::context::fiber caller_fiber_{};
 };
 
 }  // namespace rpc::runtime

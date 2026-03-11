@@ -24,6 +24,10 @@ CoroutineScheduler::~CoroutineScheduler() {
 }
 
 CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t stack_size) {
+    // 两阶段提交：
+    // 1) 在锁内完成“可调度性检查 + 分配 ID + 选择目标 worker”
+    // 2) 在锁外构造协程对象，避免持锁执行可能较慢的构造逻辑
+    // 3) 再次加锁二次确认状态并真正入队
     CoroutineId id = 0;
     std::size_t worker_index = 0;
 
@@ -34,20 +38,24 @@ CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t
         }
 
         id = allocate_id();
+        // 轮询分发到不同 worker，降低热点队列冲突。
         worker_index = dispatch_cursor_ % workers_.size();
         ++dispatch_cursor_;
     }
 
+    // 协程对象构造放在大锁外，减少全局状态锁持有时间。
     auto coroutine = std::make_shared<Coroutine>(id, std::move(callback), stack_size);
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        // 二次检查：防止第一阶段通过后，调度器在并发 stop() 中发生状态变化。
         if (!started_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire) || workers_.empty()) {
             recycled_ids_.push_back(id);
             throw std::logic_error("CoroutineScheduler is stopping, schedule rejected");
         }
 
         coroutines_.emplace(id, coroutine);
+        // pending 代表“已经入队但尚未被 worker 取走执行”的任务数。
         pending_tasks_.fetch_add(1, std::memory_order_relaxed);
 
         WorkerContext& worker = *workers_[worker_index % workers_.size()];
@@ -62,16 +70,19 @@ CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t
 }
 
 void CoroutineScheduler::start(std::size_t worker_threads) {
+    // 统一归一化 worker 数，保证至少启动 1 个线程。
     worker_threads = normalize_worker_threads(worker_threads);
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        // 已启动时直接返回，保持 start() 幂等。
         if (started_.load(std::memory_order_acquire)) {
             return;
         }
-
-        stop_requested_.store(false, std::memory_order_release);
+        // 初始化状态，准备启动 worker 线程。
+        stop_requested_.store(false, std::memory_order_release); // 确保 stop 标志重置，允许 start/stop 循环调用。
         workers_.clear();
+        // 预分配 WorkerContext，减少后续调度时的动态分配开销。
         workers_.reserve(worker_threads);
         for (std::size_t i = 0; i < worker_threads; ++i) {
             workers_.push_back(std::make_unique<WorkerContext>());
@@ -80,10 +91,12 @@ void CoroutineScheduler::start(std::size_t worker_threads) {
         started_.store(true, std::memory_order_release);
     }
 
+    // 线程创建放在锁外，避免长时间占用 state_mutex_。
     for (std::size_t index = 0; index < worker_threads; ++index) {
         workers_[index]->thread = std::thread(&CoroutineScheduler::worker_loop, this, index);
     }
 
+    // 主动唤醒一次，确保初始等待态 worker 尽快进入循环。
     for (auto& worker : workers_) {
         worker->cv.notify_all();
     }
@@ -94,6 +107,7 @@ void CoroutineScheduler::stop() {
         return;
     }
 
+    // 先排空任务，再进入停止流程，避免中途截断任务。
     wait_idle();
     stop_requested_.store(true, std::memory_order_release);
 
@@ -108,6 +122,7 @@ void CoroutineScheduler::stop() {
         }
     }
 
+    // 在锁外 join，避免阻塞其它需要 state_mutex_ 的路径。
     for (auto& thread : threads) {
         if (thread.joinable()) {
             thread.join();
@@ -135,6 +150,7 @@ void CoroutineScheduler::wait_idle() {
 }
 
 void CoroutineScheduler::recycle_terminated() {
+    // 先收集待回收 ID，避免在持锁遍历时做 erase 导致迭代器失效。
     std::vector<CoroutineId> pending_remove;
 
     {
@@ -180,8 +196,9 @@ std::size_t CoroutineScheduler::idle_switch_count() const noexcept {
 bool CoroutineScheduler::running() const noexcept {
     return started_.load(std::memory_order_acquire);
 }
-
+// 协程 ID 分配器：优先复用回收 ID，避免 ID 无界增长。
 CoroutineId CoroutineScheduler::allocate_id() {
+    // 优先复用已回收 ID，避免 ID 无界增长。
     if (!recycled_ids_.empty()) {
         const CoroutineId id = recycled_ids_.back();
         recycled_ids_.pop_back();
@@ -192,8 +209,9 @@ CoroutineId CoroutineScheduler::allocate_id() {
     ++next_id_;
     return id;
 }
-
+// 协程回收：将 ID 放回复用池，并从对象表中移除。
 void CoroutineScheduler::recycle(CoroutineId id) {
+    // 协程对象生命周期由调度器统一收口。
     std::lock_guard<std::mutex> lock(state_mutex_);
     const auto it = coroutines_.find(id);
     if (it == coroutines_.end()) {
@@ -206,6 +224,7 @@ void CoroutineScheduler::recycle(CoroutineId id) {
 }
 
 void CoroutineScheduler::worker_loop(std::size_t worker_index) {
+    // 固定绑定到自己的 WorkerContext，避免每轮循环查询 workers_。
     WorkerContext* worker = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -214,15 +233,6 @@ void CoroutineScheduler::worker_loop(std::size_t worker_index) {
         }
         worker = workers_[worker_index].get();
     }
-
-    auto idle_coroutine = std::make_shared<Coroutine>(0, [this]() {
-        // Idle 协程：空闲时短暂 sleep + yield，避免 worker 忙等空转。
-        while (!stop_requested_.load(std::memory_order_acquire)) {
-            idle_switches_.fetch_add(1, std::memory_order_relaxed);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            Coroutine::yield_current();
-        }
-    });
 
     while (true) {
         CoroutineId id = 0;
@@ -234,13 +244,8 @@ void CoroutineScheduler::worker_loop(std::size_t worker_index) {
                     return;
                 }
 
-                // 队列为空先跑一次 idle 协程，再等待条件变量唤醒。
-                lock.unlock();
-                if (idle_coroutine->state() != CoroutineState::TERM) {
-                    idle_coroutine->resume();
-                }
-                lock.lock();
-
+                // 空闲时执行小步等待，避免 busy spin；同时累加 idle 观测计数。
+                idle_switches_.fetch_add(1, std::memory_order_relaxed);
                 worker->cv.wait_for(lock, std::chrono::milliseconds(1));
             }
 
@@ -248,12 +253,14 @@ void CoroutineScheduler::worker_loop(std::size_t worker_index) {
             worker->queue.pop_front();
         }
 
+        // 任务从队列出队，pending 对应减少。
         pending_tasks_.fetch_sub(1, std::memory_order_relaxed);
         execute_coroutine(id, worker_index);
     }
 }
 
 void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_index) {
+    // 先复制 shared_ptr，确保执行期间协程对象生命周期稳定。
     std::shared_ptr<Coroutine> coroutine;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -284,13 +291,14 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
             recycle(id);
         }
     } catch (...) {
+        // 协程异常视为终止并回收，避免异常逃逸导致 worker 线程退出。
         recycle(id);
     }
 
     active_tasks_.fetch_sub(1, std::memory_order_relaxed);
     notify_idle_waiters();
 }
-
+// 将 READY 状态的协程重新入队，供 worker 线程继续调度执行。
 void CoroutineScheduler::enqueue_ready(CoroutineId id, std::size_t worker_index) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (!started_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire) || workers_.empty()) {
@@ -302,6 +310,7 @@ void CoroutineScheduler::enqueue_ready(CoroutineId id, std::size_t worker_index)
         ++dispatch_cursor_;
     }
 
+    // 默认回投到当前 worker，尽量保持执行局部性。
     WorkerContext& worker = *workers_[worker_index];
     {
         std::lock_guard<std::mutex> worker_lock(worker.mutex);

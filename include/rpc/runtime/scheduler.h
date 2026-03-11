@@ -75,6 +75,8 @@ private:
     void execute_coroutine(CoroutineId id, std::size_t worker_index);
     void enqueue_ready(CoroutineId id, std::size_t worker_index);
     void notify_idle_waiters();
+    bool accepting_tasks_locked() const;
+    std::size_t select_least_loaded_worker_locked() const;
 
     mutable std::mutex state_mutex_;
     // 调度器持有的协程对象表，生命周期由调度器统一管理。
@@ -83,10 +85,14 @@ private:
     std::vector<CoroutineId> recycled_ids_;
     // worker 上下文集合。
     std::vector<std::unique_ptr<WorkerContext>> workers_;
+    // 轮询分发游标：用于 schedule/enqueue_ready 在多 worker 间均匀投递任务。
+    std::size_t dispatch_cursor_{0};
+    // 记录每个 worker 当前“正在执行”的协程数量。
+    // key: worker 下标，value: 正在执行数。
+    std::unordered_map<std::size_t, std::size_t> worker_running_counts_;
 
     CoroutineId next_id_{1};
     std::size_t completed_count_{0};
-    std::size_t dispatch_cursor_{0};
 
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_requested_{false};

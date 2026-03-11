@@ -1,23 +1,11 @@
 #include "rpc/runtime/coroutine.h"
 
 // 文件用途：
-// 实现协程对象的状态机和上下文切换能力。
-// - Windows: 使用 Fiber 机制
-// - POSIX  : 使用 ucontext 机制
-// 同时保证正常/异常执行路径都能统一收口到 TERM，便于调度器回收。
+// 实现协程对象的状态机和上下文切换能力（基于 Boost.Context fiber）。
+// 保持原有 READY/RUNNING/TERM 语义，便于调度器无侵入复用。
 
 #include <stdexcept>
-#include <string>
 #include <utility>
-
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <ucontext.h>
-#endif
 
 namespace rpc::runtime {
 
@@ -25,13 +13,6 @@ namespace {
 
 // 线程级运行时上下文：每个线程独立维护，避免跨线程协程状态污染。
 struct ThreadRuntimeContext {
-#if defined(_WIN32)
-    // 主 Fiber，协程 yield 或结束时切回该上下文。
-    void* main_fiber{nullptr};
-#else
-    // 主上下文，协程 yield 或结束时切回该上下文。
-    ucontext_t main_context{};
-#endif
     // 当前线程正在运行的协程。
     Coroutine* current{nullptr};
 };
@@ -42,97 +23,20 @@ ThreadRuntimeContext& thread_context() {
     return ctx;
 }
 
-#if defined(_WIN32)
-void ensure_main_fiber() {
-    auto& ctx = thread_context();
-    if (ctx.main_fiber != nullptr) {
-        return;
-    }
-
-    // 首次进入协程系统时，将线程转换为 Fiber。
-    void* converted = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
-    if (converted != nullptr) {
-        ctx.main_fiber = converted;
-        return;
-    }
-
-    const DWORD err = GetLastError();
-    if (err == ERROR_ALREADY_FIBER) {
-        // 若线程本身已是 Fiber，则直接使用当前 Fiber。
-        ctx.main_fiber = GetCurrentFiber();
-        return;
-    }
-
-    // 到这里说明创建主 Fiber 失败，抛出异常由上层处理。
-    throw std::runtime_error("ConvertThreadToFiberEx failed, error=" + std::to_string(err));
-}
-#endif
-
 }  // namespace
 
 Coroutine::Coroutine(CoroutineId id, CoroutineCallback callback, std::size_t stack_size)
-    : id_(id), callback_(std::move(callback)), state_(CoroutineState::READY)
-#if defined(_WIN32)
-      ,
-      fiber_(nullptr)
-#else
-      ,
-      context_(),
-      caller_context_(nullptr),
-      stack_size_(stack_size),
-      stack_(nullptr)
-#endif
-{
+    : id_(id),
+      callback_(std::move(callback)),
+      state_(CoroutineState::READY),
+      stack_size_((stack_size == 0) ? kDefaultStackSize : stack_size) {
     if (!callback_) {
         // 协程必须绑定可执行回调。
         throw std::invalid_argument("Coroutine callback cannot be empty");
     }
-
-#if defined(_WIN32)
-    // Windows 下创建 Fiber 作为协程执行上下文。
-    fiber_ = CreateFiberEx(
-        0,
-        stack_size == 0 ? kDefaultStackSize : stack_size,
-        FIBER_FLAG_FLOAT_SWITCH,
-        reinterpret_cast<LPFIBER_START_ROUTINE>(&Coroutine::entry),
-        this
-    );
-    if (fiber_ == nullptr) {
-        throw std::runtime_error("CreateFiberEx failed, error=" + std::to_string(GetLastError()));
-    }
-#else
-    // POSIX 下分配协程栈并初始化 ucontext。
-    if (stack_size_ == 0) {
-        stack_size_ = kDefaultStackSize;
-    }
-    stack_ = new char[stack_size_];
-
-    if (getcontext(&context_) != 0) {
-        delete[] stack_;
-        stack_ = nullptr;
-        throw std::runtime_error("getcontext failed when creating coroutine");
-    }
-
-    context_.uc_stack.ss_sp = stack_;
-    context_.uc_stack.ss_size = stack_size_;
-    context_.uc_link = nullptr;
-    makecontext(&context_, reinterpret_cast<void (*)()>(&Coroutine::entry), 1, this);
-#endif
 }
 
-Coroutine::~Coroutine() {
-#if defined(_WIN32)
-    // 释放 Fiber 资源。
-    if (fiber_ != nullptr) {
-        DeleteFiber(fiber_);
-        fiber_ = nullptr;
-    }
-#else
-    // 释放协程私有栈空间。
-    delete[] stack_;
-    stack_ = nullptr;
-#endif
-}
+Coroutine::~Coroutine() = default;
 
 void Coroutine::resume() {
     // 已结束协程不可再次执行，直接返回。
@@ -150,26 +54,38 @@ void Coroutine::resume() {
         throw std::logic_error("Nested coroutine resume is not supported");
     }
 
+    // 惰性创建 fiber：确保创建和首次执行发生在同一线程。
+    ensure_fiber_initialized();
+
     state_.store(CoroutineState::RUNNING, std::memory_order_release);
     ctx.current = this;
 
-#if defined(_WIN32)
-    ensure_main_fiber();
-    // 从主 Fiber 切换到协程 Fiber。
-    SwitchToFiber(fiber_);
-#else
-    caller_context_ = &ctx.main_context;
-    // 从主上下文切换到协程上下文。
-    if (swapcontext(caller_context_, &context_) != 0) {
-        // 切换失败时终止协程，防止状态悬挂。
+    try {
+        // 切入协程执行。resume() 返回后，fiber_ 已变为“下一次可恢复句柄”。
+        fiber_ = std::move(fiber_).resume();
+    } catch (...) {
         ctx.current = nullptr;
         state_.store(CoroutineState::TERM, std::memory_order_release);
-        throw std::runtime_error("swapcontext failed on resume");
+        throw;
     }
-#endif
 
     // 协程 yield 或结束后会回到这里。
     ctx.current = nullptr;
+}
+
+void Coroutine::ensure_fiber_initialized() {
+    if (fiber_) {
+        return;
+    }
+
+    boost::context::fixedsize_stack stack_allocator{stack_size_};
+    fiber_ = boost::context::fiber(
+        std::allocator_arg,
+        std::move(stack_allocator),
+        [this](boost::context::fiber&& caller) {
+            return Coroutine::fiber_entry(std::move(caller), this);
+        }
+    );
 }
 
 void Coroutine::yield() {
@@ -186,23 +102,20 @@ void Coroutine::yield() {
     state_.store(CoroutineState::READY, std::memory_order_release);
     ctx.current = nullptr;
 
-#if defined(_WIN32)
-    if (ctx.main_fiber == nullptr) {
-        throw std::runtime_error("Main fiber is not initialized");
+    if (!caller_fiber_) {
+        throw std::runtime_error("Caller fiber is not initialized");
     }
-    // 让出执行权，切回主 Fiber。
-    SwitchToFiber(ctx.main_fiber);
-#else
-    if (caller_context_ == nullptr) {
-        throw std::runtime_error("Caller context is not initialized");
-    }
-    // 让出执行权，切回调用方上下文。
-    if (swapcontext(&context_, caller_context_) != 0) {
-        // 切换失败时终止协程，避免状态不一致。
+
+    try {
+        // 切回调度方。返回时说明调度方再次 resume 了当前协程。
+        caller_fiber_ = std::move(caller_fiber_).resume();
+    } catch (...) {
         state_.store(CoroutineState::TERM, std::memory_order_release);
-        throw std::runtime_error("swapcontext failed on yield");
+        throw;
     }
-#endif
+
+    // 从 caller 恢复回来后，当前运行协程应重新标记为 this。
+    ctx.current = this;
 }
 
 CoroutineId Coroutine::id() const noexcept {
@@ -226,10 +139,11 @@ void Coroutine::yield_current() {
     current_coroutine->yield();
 }
 
-void Coroutine::entry(void* raw_ptr) {
-    // 底层上下文入口函数，转发到实例方法执行。
-    auto* self = reinterpret_cast<Coroutine*>(raw_ptr);
+boost::context::fiber Coroutine::fiber_entry(boost::context::fiber&& caller, Coroutine* self) {
+    // 首次切入 fiber 时接收 caller 句柄，后续 yield() 依赖它切回调度方。
+    self->caller_fiber_ = std::move(caller);
     self->run();
+    return std::move(self->caller_fiber_);
 }
 
 void Coroutine::run() {
@@ -238,21 +152,10 @@ void Coroutine::run() {
         // 执行用户协程函数体。
         callback_();
     } catch (...) {
-        // 异常路径统一收口：
-        // 1) 状态标记 TERM
-        // 2) 释放回调
-        // 3) 清理 current 指针
-        // 4) 回切主上下文
+        // 异常不向外层调度器传播，统一收口为 TERM 以便安全回收。
         state_.store(CoroutineState::TERM, std::memory_order_release);
         callback_ = nullptr;
         ctx.current = nullptr;
-#if defined(_WIN32)
-        SwitchToFiber(ctx.main_fiber);
-#else
-        if (caller_context_ != nullptr) {
-            setcontext(caller_context_);
-        }
-#endif
         return;
     }
 
@@ -260,14 +163,6 @@ void Coroutine::run() {
     state_.store(CoroutineState::TERM, std::memory_order_release);
     callback_ = nullptr;
     ctx.current = nullptr;
-
-#if defined(_WIN32)
-    SwitchToFiber(ctx.main_fiber);
-#else
-    if (caller_context_ != nullptr) {
-        setcontext(caller_context_);
-    }
-#endif
 }
 
 }  // namespace rpc::runtime

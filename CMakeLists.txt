@@ -16,6 +16,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(ProjectOptions)
 rpc_apply_project_options()
+find_package(Boost REQUIRED COMPONENTS context)
 
 add_library(rpc_core
     src/common/version.cpp
@@ -31,6 +32,11 @@ add_library(rpc_core
 target_include_directories(rpc_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(rpc_core
+    PRIVATE
+        Boost::context
 )
 
 add_executable(rpc_gateway_app
