@@ -21,7 +21,12 @@ find_package(Boost REQUIRED COMPONENTS context)
 add_library(rpc_core
     src/common/version.cpp
     src/runtime/coroutine.cpp
+    src/runtime/hook.cpp
+    src/runtime/io_manager.cpp
+    src/runtime/request_context.cpp
+    src/runtime/retry_budget.cpp
     src/runtime/scheduler.cpp
+    src/runtime/timer.cpp
     src/runtime/runtime_stub.cpp
     src/net/net_stub.cpp
     src/gateway/gateway_stub.cpp
@@ -37,6 +42,7 @@ target_include_directories(rpc_core
 target_link_libraries(rpc_core
     PRIVATE
         Boost::context
+        ${CMAKE_DL_LIBS}
 )
 
 add_executable(rpc_gateway_app
@@ -104,4 +110,60 @@ target_link_libraries(scheduler_mn_test
 add_test(
     NAME scheduler_mn_test
     COMMAND scheduler_mn_test
+)
+
+add_executable(io_epoll_integration_test
+    tests/unit/io_epoll_integration_test.cpp
+)
+
+target_link_libraries(io_epoll_integration_test
+    PRIVATE
+        rpc_core
+)
+
+add_test(
+    NAME io_epoll_integration_test
+    COMMAND io_epoll_integration_test
+)
+
+add_executable(timer_heap_test
+    tests/unit/timer_heap_test.cpp
+)
+
+target_link_libraries(timer_heap_test
+    PRIVATE
+        rpc_core
+)
+
+add_test(
+    NAME timer_heap_test
+    COMMAND timer_heap_test
+)
+
+add_executable(hook_syscall_test
+    tests/unit/hook_syscall_test.cpp
+)
+
+target_link_libraries(hook_syscall_test
+    PRIVATE
+        rpc_core
+)
+
+add_test(
+    NAME hook_syscall_test
+    COMMAND hook_syscall_test
+)
+
+add_executable(w7_timeout_retry_test
+    tests/unit/w7_timeout_retry_test.cpp
+)
+
+target_link_libraries(w7_timeout_retry_test
+    PRIVATE
+        rpc_core
+)
+
+add_test(
+    NAME w7_timeout_retry_test
+    COMMAND w7_timeout_retry_test
 )

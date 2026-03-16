@@ -16,11 +16,13 @@ namespace rpc::runtime {
 // 协程生命周期状态：
 // READY   : 可被调度执行
 // RUNNING : 正在执行
+// WAITING : 等待外部事件唤醒（如 IO 就绪）
 // TERM    : 执行结束（正常结束或异常结束）
 enum class CoroutineState : std::uint8_t {
     READY = 0,
     RUNNING = 1,
-    TERM = 2,
+    WAITING = 2,
+    TERM = 3,
 };
 
 // 协程唯一标识类型。
@@ -55,6 +57,14 @@ public:
     // RUNNING -> READY，并切回调用方上下文。
     void yield();
 
+    // 协程进入等待态并让出执行权：
+    // RUNNING -> WAITING，用于等待 IO/定时器等外部事件唤醒。
+    void yield_waiting();
+
+    // 尝试将 WAITING 协程标记为 READY。
+    // 仅当当前状态为 WAITING 时返回 true（CAS 成功）。
+    bool try_mark_ready_from_waiting() noexcept;
+
     // 获取协程 ID。
     CoroutineId id() const noexcept;
 
@@ -67,6 +77,10 @@ public:
     // 便捷接口：让当前协程主动 yield。
     // 若当前没有运行中的协程会抛出逻辑异常。
     static void yield_current();
+
+    // 便捷接口：让当前协程进入 WAITING 并让出执行权。
+    // 若当前没有运行中的协程会抛出逻辑异常。
+    static void yield_current_waiting();
 
 private:
     // 在首次 resume 时惰性创建 fiber，避免跨线程创建/执行导致上下文断言失败。

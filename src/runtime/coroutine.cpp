@@ -2,7 +2,7 @@
 
 // 文件用途：
 // 实现协程对象的状态机和上下文切换能力（基于 Boost.Context fiber）。
-// 保持原有 READY/RUNNING/TERM 语义，便于调度器无侵入复用。
+// 保持 READY/RUNNING/WAITING/TERM 语义，便于调度器无侵入复用。
 
 #include <stdexcept>
 #include <utility>
@@ -118,6 +118,45 @@ void Coroutine::yield() {
     ctx.current = this;
 }
 
+void Coroutine::yield_waiting() {
+    // 状态约束：仅允许 RUNNING -> WAITING。
+    if (state_.load(std::memory_order_acquire) != CoroutineState::RUNNING) {
+        throw std::logic_error("Coroutine can only yield_waiting from RUNNING state");
+    }
+
+    auto& ctx = thread_context();
+    if (ctx.current != this) {
+        throw std::logic_error("Only current running coroutine can yield_waiting");
+    }
+
+    state_.store(CoroutineState::WAITING, std::memory_order_release);
+    ctx.current = nullptr;
+
+    if (!caller_fiber_) {
+        throw std::runtime_error("Caller fiber is not initialized");
+    }
+
+    try {
+        // 切回调度方。返回时说明调度方再次 resume 了当前协程。
+        caller_fiber_ = std::move(caller_fiber_).resume();
+    } catch (...) {
+        state_.store(CoroutineState::TERM, std::memory_order_release);
+        throw;
+    }
+
+    ctx.current = this;
+}
+
+bool Coroutine::try_mark_ready_from_waiting() noexcept {
+    CoroutineState expected = CoroutineState::WAITING;
+    return state_.compare_exchange_strong(
+        expected,
+        CoroutineState::READY,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire
+    );
+}
+
 CoroutineId Coroutine::id() const noexcept {
     return id_;
 }
@@ -137,6 +176,14 @@ void Coroutine::yield_current() {
         throw std::logic_error("No current coroutine to yield");
     }
     current_coroutine->yield();
+}
+
+void Coroutine::yield_current_waiting() {
+    Coroutine* current_coroutine = Coroutine::current();
+    if (current_coroutine == nullptr) {
+        throw std::logic_error("No current coroutine to yield_waiting");
+    }
+    current_coroutine->yield_waiting();
 }
 
 boost::context::fiber Coroutine::fiber_entry(boost::context::fiber&& caller, Coroutine* self) {

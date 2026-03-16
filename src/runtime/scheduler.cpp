@@ -55,6 +55,7 @@ CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t
         }
 
         coroutines_.emplace(id, coroutine);
+        coroutine_last_worker_[id] = worker_index;
         // pending 代表“已经入队但尚未被 worker 取走执行”的任务数。
         pending_tasks_.fetch_add(1, std::memory_order_relaxed);
 
@@ -67,6 +68,70 @@ CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t
     }
 
     return id;
+}
+
+bool CoroutineScheduler::resume(CoroutineId id) {
+    WorkerContext* target_worker = nullptr;
+    bool need_notify = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!started_.load(std::memory_order_acquire)
+            || stop_requested_.load(std::memory_order_acquire)
+            || workers_.empty()) {
+            return false;
+        }
+
+        const auto it = coroutines_.find(id);
+        if (it == coroutines_.end()) {
+            return false;
+        }
+
+        const std::shared_ptr<Coroutine>& coroutine = it->second;
+        const CoroutineState state = coroutine->state();
+
+        if (state == CoroutineState::RUNNING) {
+            // 恢复请求早于协程挂起：先记录，待 execute_coroutine 看到 WAITING 后补发。
+            if (running_coroutines_.find(id) != running_coroutines_.end()) {
+                pending_resumes_.insert(id);
+                return true;
+            }
+            return false;
+        }
+
+        if (!coroutine->try_mark_ready_from_waiting()) {
+            return false;
+        }
+
+        // 若协程尚在当前 worker 执行栈回退中，则让 execute_coroutine 统一入队，避免重复投递。
+        if (running_coroutines_.find(id) != running_coroutines_.end()) {
+            return true;
+        }
+
+        std::size_t worker_index = 0;
+        const auto worker_it = coroutine_last_worker_.find(id);
+        if (worker_it != coroutine_last_worker_.end() && worker_it->second < workers_.size()) {
+            worker_index = worker_it->second;
+        } else {
+            worker_index = dispatch_cursor_ % workers_.size();
+            ++dispatch_cursor_;
+            coroutine_last_worker_[id] = worker_index;
+        }
+
+        WorkerContext& worker = *workers_[worker_index];
+        {
+            std::lock_guard<std::mutex> worker_lock(worker.mutex);
+            worker.queue.push_back(id);
+        }
+        pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+        target_worker = &worker;
+        need_notify = true;
+    }
+
+    if (need_notify && target_worker != nullptr) {
+        target_worker->cv.notify_one();
+    }
+    return true;
 }
 
 void CoroutineScheduler::start(std::size_t worker_threads) {
@@ -220,6 +285,9 @@ void CoroutineScheduler::recycle(CoroutineId id) {
 
     coroutines_.erase(it);
     recycled_ids_.push_back(id);
+    coroutine_last_worker_.erase(id);
+    running_coroutines_.erase(id);
+    pending_resumes_.erase(id);
     ++completed_count_;
 }
 
@@ -270,6 +338,8 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
             return;
         }
         coroutine = it->second;
+        coroutine_last_worker_[id] = worker_index;
+        running_coroutines_.insert(id);
     }
 
     if (coroutine->state() == CoroutineState::TERM) {
@@ -280,18 +350,45 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
     }
 
     active_tasks_.fetch_add(1, std::memory_order_relaxed);
+    bool should_requeue_ready = false;
+    bool should_recycle = false;
     try {
         coroutine->resume();
 
         if (coroutine->state() == CoroutineState::READY) {
             // 协程主动 yield，重新入队等待下次调度。
-            enqueue_ready(id, worker_index);
+            should_requeue_ready = true;
+        } else if (coroutine->state() == CoroutineState::WAITING) {
+            bool should_resume_after_wait = false;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                const auto pending_it = pending_resumes_.find(id);
+                if (pending_it != pending_resumes_.end()) {
+                    pending_resumes_.erase(pending_it);
+                    should_resume_after_wait = true;
+                }
+            }
+
+            if (should_resume_after_wait && coroutine->try_mark_ready_from_waiting()) {
+                should_requeue_ready = true;
+            }
         } else if (coroutine->state() == CoroutineState::TERM) {
             // 协程执行完成，立即回收。
-            recycle(id);
+            should_recycle = true;
         }
     } catch (...) {
         // 协程异常视为终止并回收，避免异常逃逸导致 worker 线程退出。
+        should_recycle = true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        running_coroutines_.erase(id);
+    }
+
+    if (should_requeue_ready) {
+        enqueue_ready(id, worker_index);
+    } else if (should_recycle) {
         recycle(id);
     }
 
@@ -309,6 +406,7 @@ void CoroutineScheduler::enqueue_ready(CoroutineId id, std::size_t worker_index)
         worker_index = dispatch_cursor_ % workers_.size();
         ++dispatch_cursor_;
     }
+    coroutine_last_worker_[id] = worker_index;
 
     // 默认回投到当前 worker，尽量保持执行局部性。
     WorkerContext& worker = *workers_[worker_index];

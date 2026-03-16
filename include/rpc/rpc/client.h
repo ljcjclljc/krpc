@@ -29,6 +29,9 @@ struct RpcRequest {
 
     // 请求超时时间（毫秒），0 表示未设置。
     std::uint64_t timeout_ms{0};
+
+    // 最大重试次数（不含首发）。
+    std::size_t max_retries{0};
 };
 
 // 一次 RPC 调用响应模型。
@@ -41,6 +44,12 @@ struct RpcResponse {
 
     // 响应数据载荷。
     std::string payload;
+
+    // 本次调用总尝试次数（含首发）。
+    std::size_t attempts{0};
+
+    // 本次生效的 net 超时预算（毫秒）。
+    std::uint64_t effective_timeout_ms{0};
 };
 
 // 服务节点模型（服务发现结果）。

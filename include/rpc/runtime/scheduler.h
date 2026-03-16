@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,11 @@ public:
 
     // 创建协程并入队（仅在线程池启动后可调用）。
     CoroutineId schedule(CoroutineCallback callback, std::size_t stack_size = Coroutine::kDefaultStackSize);
+
+    // 恢复 WAITING 协程：
+    // - WAITING 协程会被转为 READY 并重新入队；
+    // - RUNNING 协程会记录“待恢复”，在其进入 WAITING 后立即补发恢复。
+    bool resume(CoroutineId id);
 
     // 启动 M:N 调度线程池。
     // worker_threads == 0 时自动使用 hardware_concurrency（至少 1）。
@@ -89,7 +95,12 @@ private:
     std::size_t dispatch_cursor_{0};
     // 记录每个 worker 当前“正在执行”的协程数量。
     // key: worker 下标，value: 正在执行数。
-    std::unordered_map<std::size_t, std::size_t> worker_running_counts_;
+    // 记录协程最近一次运行的 worker，用于恢复时优先投递回原线程。
+    std::unordered_map<CoroutineId, std::size_t> coroutine_last_worker_;
+    // 当前正在 worker 中执行的协程集合（用于处理“恢复先于挂起”的竞态）。
+    std::unordered_set<CoroutineId> running_coroutines_;
+    // 记录对 RUNNING 协程的提前恢复请求，等其进入 WAITING 后补发。
+    std::unordered_set<CoroutineId> pending_resumes_;
 
     CoroutineId next_id_{1};
     std::size_t completed_count_{0};
