@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package rpc.raft;
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+message ServiceInstance {
+  string id = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+
+message ConfigEntry {
+  string key = 1;
+  string value = 2;
+}
+
+message ServiceEntry {
+  string service = 1;
+  repeated ServiceInstance instances = 2;
+}
+
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  COMMAND_TYPE_UPSERT_CONFIG = 1;
+  COMMAND_TYPE_ERASE_CONFIG = 2;
+  COMMAND_TYPE_REGISTER_SERVICE = 3;
+  COMMAND_TYPE_UNREGISTER_SERVICE = 4;
+  COMMAND_TYPE_BEGIN_JOINT_CONSENSUS = 5;
+  COMMAND_TYPE_FINALIZE_JOINT_CONSENSUS = 6;
+}
+
+message Command {
+  CommandType type = 1;
+  string key = 2;
+  string value = 3;
+  string service = 4;
+  ServiceInstance instance = 5;
+  repeated string voters = 6;
+}
+
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  Command command = 3;
+}
+
+message Snapshot {
+  uint64 last_included_index = 1;
+  uint64 last_included_term = 2;
+  repeated ConfigEntry configs = 3;
+  repeated ServiceEntry services = 4;
+}
+
+message NodeMeta {
+  string node_id = 1;
+  uint64 current_term = 2;
+  string voted_for = 3;
+  uint64 commit_index = 4;
+  uint64 last_applied = 5;
+}
+
+message RequestVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;
+}
+
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  Snapshot snapshot = 3;
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
+
+message RpcRequestEnvelope {
+  oneof payload {
+    RequestVoteRequest request_vote = 1;
+    AppendEntriesRequest append_entries = 2;
+    InstallSnapshotRequest install_snapshot = 3;
+  }
+}
+
+message RpcResponseEnvelope {
+  oneof payload {
+    RequestVoteResponse request_vote = 1;
+    AppendEntriesResponse append_entries = 2;
+    InstallSnapshotResponse install_snapshot = 3;
+  }
+}

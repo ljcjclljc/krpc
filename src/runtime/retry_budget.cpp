@@ -10,13 +10,27 @@
 namespace rpc::runtime {
 
 RetryBudget::RetryBudget(RetryBudgetOptions options)
-    : options_(options) {
-    if (options_.window.count() <= 0) {
-        throw std::invalid_argument("RetryBudget window must be positive");
+    : options_(normalize_options(options)) {
+}
+
+RetryBudgetOptions RetryBudget::normalize_options(RetryBudgetOptions options) {
+    if (options.window.count() <= 0) {
+        options.window = std::chrono::milliseconds(1);
     }
-    if (options_.retry_ratio < 0.0) {
-        throw std::invalid_argument("RetryBudget retry_ratio must be non-negative");
+    if (options.retry_ratio < 0.0) {
+        options.retry_ratio = 0.0;
     }
+    if (std::isnan(options.retry_ratio) != 0) {
+        options.retry_ratio = 0.0;
+    }
+    return options;
+}
+
+void RetryBudget::update_options(RetryBudgetOptions options) {
+    const Clock::time_point now = Clock::now();
+    std::lock_guard<std::mutex> lock(mutex_);
+    options_ = normalize_options(options);
+    evict_expired_locked(now);
 }
 
 void RetryBudget::record_request() {
@@ -52,6 +66,23 @@ std::size_t RetryBudget::retry_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     evict_expired_locked(now);
     return retry_timestamps_.size();
+}
+
+RetryBudgetSnapshot RetryBudget::snapshot() const {
+    const Clock::time_point now = Clock::now();
+    std::lock_guard<std::mutex> lock(mutex_);
+    evict_expired_locked(now);
+
+    const std::size_t max_tokens = max_retry_tokens_locked();
+    const std::size_t retries = retry_timestamps_.size();
+    const std::size_t available_tokens = retries >= max_tokens ? 0 : (max_tokens - retries);
+
+    RetryBudgetSnapshot result;
+    result.request_count = request_timestamps_.size();
+    result.retry_count = retries;
+    result.max_retry_tokens = max_tokens;
+    result.available_retry_tokens = available_tokens;
+    return result;
 }
 
 void RetryBudget::evict_expired_locked(Clock::time_point now) const {

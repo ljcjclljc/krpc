@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rpc/runtime/retry_budget.h"
+
 namespace rpc::client {
 
 // 一次 RPC 调用请求模型。
@@ -50,6 +52,77 @@ struct RpcResponse {
 
     // 本次生效的 net 超时预算（毫秒）。
     std::uint64_t effective_timeout_ms{0};
+
+    // 请求是否被取消（主动取消或 deadline 取消）。
+    bool cancelled{false};
+
+    // 取消原因（未取消时为空）。
+    std::string cancel_reason;
+
+    // 重试预算窗口观测信息。
+    std::size_t retry_budget_request_count{0};
+    std::size_t retry_budget_retry_count{0};
+    std::size_t retry_budget_max_tokens{0};
+    std::size_t retry_budget_available_tokens{0};
+
+    // 是否触发降级路径。
+    bool degraded{false};
+
+    // 降级策略：cache/static/none。
+    std::string degrade_strategy;
+
+    // 选中的上游节点标识（host:port）。
+    std::string selected_endpoint;
+
+    // 流量染色命中标签（例如 stable/gray）。
+    std::string traffic_lane;
+
+    // 选中节点调用时的熔断状态。
+    std::string circuit_state;
+};
+
+enum class CircuitBreakerState {
+    Closed = 0,
+    Open = 1,
+    HalfOpen = 2,
+};
+
+// 最近一次负载均衡决策快照（用于 W13 验收可观测）。
+struct LoadBalancerDecisionSnapshot {
+    bool has_selection{false};
+    bool blocked_by_circuit_breaker{false};
+    bool gray_routed{false};
+    std::string selected_node_id;
+    std::string selected_endpoint;
+    std::string traffic_lane;
+    CircuitBreakerState circuit_state{CircuitBreakerState::Closed};
+    double score{0.0};
+};
+
+struct LoadBalancerRuntimeStats {
+    std::size_t select_calls{0};
+    std::size_t blocked_by_circuit_breaker{0};
+    std::size_t gray_routed{0};
+    std::size_t feedback_calls{0};
+    std::uint64_t select_lock_wait_ns_total{0};
+    std::uint64_t feedback_lock_wait_ns_total{0};
+    std::unordered_map<std::string, std::size_t> selected_endpoint_counts;
+};
+
+// 最近一次 RPC 调用审计快照（用于链路透传与日志关联验收）。
+struct RpcInvokeAuditSnapshot {
+    std::string trace_id;
+    std::string span_id;
+    std::string service;
+    std::string method;
+    std::string endpoint;
+    int code{0};
+    std::string message;
+    std::size_t attempts{0};
+    bool degraded{false};
+    std::string degrade_strategy;
+    std::string traffic_lane;
+    std::string circuit_state;
 };
 
 // 服务节点模型（服务发现结果）。
@@ -62,6 +135,15 @@ struct ServiceNode {
 
     // 节点端口。
     std::uint16_t port{0};
+
+    // 节点标签（用于灰度/染色/分组）。
+    std::unordered_map<std::string, std::string> labels;
+
+    // 采集上报的实时状态（[0,1] 或实际值）；-1 表示未知。
+    double cpu_utilization{-1.0};
+    double memory_utilization{-1.0};
+    double qps{-1.0};
+    double latency_ms{-1.0};
 };
 
 // 服务发现抽象接口：
@@ -83,6 +165,20 @@ public:
     ) = 0;
 };
 
+// 负载均衡运行时反馈接口：
+// 用于接收调用结果，驱动实时状态收敛（熔断/恢复/负载因子更新）。
+class ILoadBalancerRuntimeFeedback {
+public:
+    virtual ~ILoadBalancerRuntimeFeedback() = default;
+    virtual void on_invoke_result(
+        const ServiceNode& node,
+        const RpcRequest& request,
+        const RpcResponse& response,
+        std::uint64_t observed_latency_ms
+    ) = 0;
+    virtual LoadBalancerDecisionSnapshot last_decision_snapshot() const = 0;
+};
+
 // RPC 客户端抽象接口：
 // 上层统一通过 invoke 发起调用，不感知底层策略实现。
 class IRpcClient {
@@ -96,6 +192,7 @@ public:
 struct ClientInitOptions {
     std::shared_ptr<IServiceDiscovery> discovery;
     std::shared_ptr<ILoadBalancer> load_balancer;
+    rpc::runtime::RetryBudgetOptions retry_budget_options{};
 };
 
 // 初始化全局默认客户端实例。
@@ -103,5 +200,14 @@ void init_client(ClientInitOptions options = {});
 
 // 获取全局默认客户端实例。
 std::shared_ptr<IRpcClient> default_client();
+
+// 读取最近一次 RPC 调用审计快照。
+RpcInvokeAuditSnapshot last_invoke_audit_snapshot();
+
+// 读取最近一次负载均衡决策快照。
+LoadBalancerDecisionSnapshot last_load_balancer_decision_snapshot();
+
+// 读取负载均衡运行态剖面快照。
+LoadBalancerRuntimeStats load_balancer_runtime_stats();
 
 }  // namespace rpc::client

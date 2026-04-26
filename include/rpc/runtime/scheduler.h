@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -15,6 +16,21 @@
 #include "rpc/runtime/coroutine.h"
 
 namespace rpc::runtime {
+
+struct SchedulerProfileSnapshot {
+    std::size_t enqueue_local{0};
+    std::size_t enqueue_global{0};
+    std::size_t enqueue_fast{0};
+
+    std::size_t dequeue_local_fast{0};
+    std::size_t dequeue_local{0};
+    std::size_t dequeue_global{0};
+    std::size_t dequeue_steal{0};
+
+    std::uint64_t state_lock_wait_ns_total{0};
+    std::size_t state_lock_wait_samples{0};
+    std::uint64_t state_lock_wait_ns_avg{0};
+};
 
 class CoroutineScheduler {
 public:
@@ -62,13 +78,21 @@ public:
     // idle 协程循环次数（用于观测空闲调度是否生效）。
     std::size_t idle_switch_count() const noexcept;
 
+    // 工作窃取次数（用于观测负载均衡效果）。
+    std::size_t steal_count() const noexcept;
+
+    // 调度剖面快照（队列出入分布 + 锁等待）。
+    SchedulerProfileSnapshot profile_snapshot() const noexcept;
+
     // 当前是否处于 worker 调度模式。
     bool running() const noexcept;
 
 private:
     struct WorkerContext {
-        // 每个 worker 自己的就绪队列与同步原语，降低跨线程抢锁冲突。
-        std::deque<CoroutineId> queue;
+        // 协程本地快队列：协程 yield 或 IO 恢复后优先进入，降低调度往返开销。
+        std::deque<CoroutineId> local_fast_queue;
+        // 线程本地队列：worker 常规可执行队列。
+        std::deque<CoroutineId> local_queue;
         std::mutex mutex;
         std::condition_variable cv;
         std::thread thread;
@@ -81,8 +105,11 @@ private:
     void execute_coroutine(CoroutineId id, std::size_t worker_index);
     void enqueue_ready(CoroutineId id, std::size_t worker_index);
     void notify_idle_waiters();
-    bool accepting_tasks_locked() const;
-    std::size_t select_least_loaded_worker_locked() const;
+    bool try_dequeue_local_fast(WorkerContext& worker, CoroutineId& id);
+    bool try_dequeue_local(WorkerContext& worker, CoroutineId& id);
+    bool try_dequeue_global(CoroutineId& id);
+    bool try_steal_from_other_worker(std::size_t thief_index, CoroutineId& id);
+    bool try_dequeue_next(std::size_t worker_index, WorkerContext& worker, CoroutineId& id);
 
     mutable std::mutex state_mutex_;
     // 调度器持有的协程对象表，生命周期由调度器统一管理。
@@ -91,6 +118,9 @@ private:
     std::vector<CoroutineId> recycled_ids_;
     // worker 上下文集合。
     std::vector<std::unique_ptr<WorkerContext>> workers_;
+    // 全局队列：外部线程提交任务先进入该队列，再由 worker 分发执行。
+    std::deque<CoroutineId> global_queue_;
+    mutable std::mutex global_queue_mutex_;
     // 轮询分发游标：用于 schedule/enqueue_ready 在多 worker 间均匀投递任务。
     std::size_t dispatch_cursor_{0};
     // 记录每个 worker 当前“正在执行”的协程数量。
@@ -99,6 +129,8 @@ private:
     std::unordered_map<CoroutineId, std::size_t> coroutine_last_worker_;
     // 当前正在 worker 中执行的协程集合（用于处理“恢复先于挂起”的竞态）。
     std::unordered_set<CoroutineId> running_coroutines_;
+    // 标记是否已进入过执行路径（用于限制可窃取任务范围）。
+    std::unordered_set<CoroutineId> started_coroutines_;
     // 记录对 RUNNING 协程的提前恢复请求，等其进入 WAITING 后补发。
     std::unordered_set<CoroutineId> pending_resumes_;
 
@@ -111,6 +143,16 @@ private:
     std::atomic<std::size_t> pending_tasks_{0};
     std::atomic<std::size_t> active_tasks_{0};
     std::atomic<std::size_t> idle_switches_{0};
+    std::atomic<std::size_t> steal_count_{0};
+    std::atomic<std::size_t> enqueue_local_count_{0};
+    std::atomic<std::size_t> enqueue_global_count_{0};
+    std::atomic<std::size_t> enqueue_fast_count_{0};
+    std::atomic<std::size_t> dequeue_local_fast_count_{0};
+    std::atomic<std::size_t> dequeue_local_count_{0};
+    std::atomic<std::size_t> dequeue_global_count_{0};
+    std::atomic<std::size_t> dequeue_steal_count_{0};
+    std::atomic<std::uint64_t> state_lock_wait_ns_total_{0};
+    std::atomic<std::size_t> state_lock_wait_samples_{0};
 
     // 用于 wait_idle 的条件变量通知。
     mutable std::mutex idle_mutex_;

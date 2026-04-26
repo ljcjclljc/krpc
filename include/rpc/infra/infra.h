@@ -82,6 +82,23 @@ void init_infra(InfraInitOptions options = {});
 // 触发一次“从配置中心刷新到本地”的同步流程。
 bool refresh_config_from_center();
 
+// 直接发布一份新快照（要求 version 严格递增）。
+// 返回 true 表示发布生效，false 表示版本不新或 infra 未初始化。
+bool publish_config_snapshot(const ConfigSnapshot& snapshot);
+
+// 在当前快照上应用补丁并自动生成新版本（current.version + 1）。
+// 返回 true 表示补丁发布成功；若提供 applied_version，会写入新版本号。
+bool publish_config_patch(
+    const ConfigMap& patch,
+    std::uint64_t* applied_version = nullptr
+);
+
+// 回滚到指定历史版本。
+bool rollback_config_to(std::uint64_t version);
+
+// 读取当前配置版本；infra 未初始化时返回 0。
+std::uint64_t current_config_version();
+
 // 获取全局配置仓库只读引用。
 const ConfigRepository& config_repository();
 

@@ -17,9 +17,19 @@ struct RetryBudgetOptions {
     std::size_t min_retry_tokens{1};
 };
 
+struct RetryBudgetSnapshot {
+    std::size_t request_count{0};
+    std::size_t retry_count{0};
+    std::size_t max_retry_tokens{0};
+    std::size_t available_retry_tokens{0};
+};
+
 class RetryBudget {
 public:
     explicit RetryBudget(RetryBudgetOptions options = {});
+
+    // 更新预算参数（线程安全）。
+    void update_options(RetryBudgetOptions options);
 
     // 记录一次请求（非重试）进入当前窗口。
     void record_request();
@@ -31,9 +41,12 @@ public:
     // 观测接口。
     std::size_t request_count() const;
     std::size_t retry_count() const;
+    RetryBudgetSnapshot snapshot() const;
 
 private:
     using Clock = std::chrono::steady_clock;
+
+    static RetryBudgetOptions normalize_options(RetryBudgetOptions options);
 
     void evict_expired_locked(Clock::time_point now) const;
     std::size_t max_retry_tokens_locked() const;

@@ -36,6 +36,7 @@ int main() {
     constexpr std::size_t kProducerThreads = 4;
     constexpr std::size_t kCoroutinesPerProducer = 200;
     constexpr std::size_t kYieldPerCoroutine = 8;
+    constexpr std::size_t kStealFanoutCoroutines = 8000;
     constexpr std::size_t kRestartCoroutines = 64;
 
     rpc::runtime::CoroutineScheduler scheduler;
@@ -81,6 +82,17 @@ int main() {
         producer.join();
     }
 
+    // 在单个协程内批量派生子协程，构造“单 worker 聚集 -> 其他 worker 窃取”场景。
+    std::atomic<std::size_t> fanout_finished{0};
+    scheduler.schedule([&scheduler, &fanout_finished]() {
+        for (std::size_t i = 0; i < kStealFanoutCoroutines; ++i) {
+            scheduler.schedule([&fanout_finished]() {
+                rpc::runtime::Coroutine::yield_current();
+                fanout_finished.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+    });
+
     if (!wait_idle_with_timeout(scheduler, 15s)) {
         std::cerr << "wait_idle timeout in stress phase, potential deadlock\n";
         scheduler.stop();
@@ -101,6 +113,17 @@ int main() {
     if (yields.load(std::memory_order_relaxed) != expected_yields) {
         std::cerr << "yield count mismatch, expected=" << expected_yields
                   << ", actual=" << yields.load(std::memory_order_relaxed) << '\n';
+        return 1;
+    }
+
+    if (fanout_finished.load(std::memory_order_relaxed) != kStealFanoutCoroutines) {
+        std::cerr << "fanout finished mismatch, expected=" << kStealFanoutCoroutines
+                  << ", actual=" << fanout_finished.load(std::memory_order_relaxed) << '\n';
+        return 1;
+    }
+
+    if (scheduler.steal_count() == 0) {
+        std::cerr << "work stealing was not observed\n";
         return 1;
     }
 
@@ -162,7 +185,10 @@ int main() {
         return 1;
     }
 
-    const std::size_t expected_completed = expected_coroutines + kRestartCoroutines;
+    const std::size_t expected_completed = expected_coroutines
+        + kStealFanoutCoroutines
+        + 1 // fanout driver coroutine
+        + kRestartCoroutines;
     if (scheduler.completed_count() != expected_completed) {
         std::cerr << "completed_count mismatch, expected=" << expected_completed
                   << ", actual=" << scheduler.completed_count() << '\n';
@@ -178,6 +204,7 @@ int main() {
     std::cout << "scheduler_mn_test passed"
               << ", completed=" << scheduler.completed_count()
               << ", idle_switches=" << scheduler.idle_switch_count()
+              << ", steals=" << scheduler.steal_count()
               << ", yields=" << yields.load(std::memory_order_relaxed)
               << '\n';
     return 0;

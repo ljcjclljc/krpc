@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package rpc.krpc;
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+message KrpcRequest {
+  string service = 1;
+  string method = 2;
+  bytes payload = 3;
+  map<string, string> metadata = 4;
+  uint64 timeout_ms = 5;
+  uint64 max_retries = 6;
+}
+
+message KrpcResponse {
+  int32 code = 1;
+  string message = 2;
+  bytes payload = 3;
+  bool retryable = 4;
+  uint64 effective_timeout_ms = 5;
+  bool cancelled = 6;
+  string cancel_reason = 7;
+}

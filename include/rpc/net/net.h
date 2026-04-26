@@ -19,6 +19,8 @@ void init_network();
 struct EffectiveTimeout {
     std::uint64_t effective_timeout_ms{0};
     bool deadline_exceeded{false};
+    bool cancelled{false};
+    std::string cancel_reason;
 };
 
 // 结合上游 deadline 与下游 timeout 配置，计算 net 层有效超时。
@@ -27,11 +29,10 @@ EffectiveTimeout derive_effective_timeout(std::uint64_t downstream_timeout_ms);
 
 // net 层模拟请求模型（用于 W7 超时/重试链路验证）。
 struct NetCallRequest {
-    std::string endpoint;
-    std::string payload;
+    std::string endpoint;// 目标地址
+    std::string payload;// 请求载荷
     std::uint64_t downstream_timeout_ms{0};
     std::size_t attempt{1}; // 1-based
-    std::size_t fail_before_success{0};
 };
 
 // net 层模拟请求结果。
@@ -41,12 +42,29 @@ struct NetCallResponse {
     std::string payload;
     bool retryable{false};
     std::uint64_t effective_timeout_ms{0};
+    bool cancelled{false};
+    std::string cancel_reason;
 };
 
-// 模拟一次 net 调用，内部会应用超时分层结果。
-NetCallResponse invoke_stub(const NetCallRequest& request);
+// TLS 运行态快照（用于热轮转可观测与测试）。
+struct NetTlsRuntimeSnapshot {
+    bool tls_enabled{false};
+    bool mtls_enabled{false};
+    std::uint64_t loaded_config_version{0};
+    std::size_t context_reload_count{0};
+    std::size_t context_reload_failures{0};
+};
+
+// 真实 TCP 调用：
+// - endpoint 期望为 "host:port"
+// - 请求载荷通过 send 发送，响应载荷通过 recv 返回
+// - 调用路径复用超时分层预算
+NetCallResponse invoke_tcp(const NetCallRequest& request);
 
 // 观测上一次 net 调用使用的有效超时（用于测试验收）。
 std::uint64_t last_effective_timeout_ms() noexcept;
+
+// 观测 TLS 运行态（包含上下文重载计数）。
+NetTlsRuntimeSnapshot tls_runtime_snapshot() noexcept;
 
 }  // namespace rpc::net

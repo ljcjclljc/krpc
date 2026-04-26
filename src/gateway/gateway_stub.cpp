@@ -7,7 +7,7 @@
 
 #include <utility>
 
-#include "rpc/runtime/request_context.h"
+#include "rpc/runtime/runtime.h"
 
 namespace rpc::gateway {
 
@@ -20,11 +20,11 @@ rpc::client::RpcResponse invoke_with_deadline(
     std::chrono::milliseconds upstream_timeout,
     std::string request_id
 ) {
-    const auto context = rpc::runtime::RequestContext::create_with_timeout(
+    const auto context = rpc::runtime::create_deadline_context(
         std::move(request_id),
         upstream_timeout
     );
-    rpc::runtime::ScopedRequestContext scoped_context(context);
+    rpc::runtime::ScopedDeadlineContext scoped_context(context);
     return rpc::client::default_client()->invoke(request);
 }
 

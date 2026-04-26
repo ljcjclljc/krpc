@@ -17,6 +17,26 @@ std::size_t normalize_worker_threads(std::size_t worker_threads) {
     return hardware == 0 ? 1 : hardware;
 }
 
+constexpr std::size_t kInvalidWorkerIndex = static_cast<std::size_t>(-1);
+thread_local CoroutineScheduler* t_current_scheduler = nullptr;
+thread_local std::size_t t_current_worker_index = kInvalidWorkerIndex;
+
+template <typename Mutex, typename WaitAtomic, typename SampleAtomic>
+std::unique_lock<Mutex> timed_lock(
+    Mutex& mutex,
+    WaitAtomic& wait_ns_total,
+    SampleAtomic& wait_samples
+) {
+    const auto wait_started = std::chrono::steady_clock::now();
+    std::unique_lock<Mutex> lock(mutex);
+    const auto waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - wait_started
+    ).count();
+    wait_ns_total.fetch_add(static_cast<std::uint64_t>(waited_ns), std::memory_order_relaxed);
+    wait_samples.fetch_add(1, std::memory_order_relaxed);
+    return lock;
+}
+
 }  // namespace
 
 CoroutineScheduler::~CoroutineScheduler() {
@@ -25,29 +45,32 @@ CoroutineScheduler::~CoroutineScheduler() {
 
 CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t stack_size) {
     // 两阶段提交：
-    // 1) 在锁内完成“可调度性检查 + 分配 ID + 选择目标 worker”
-    // 2) 在锁外构造协程对象，避免持锁执行可能较慢的构造逻辑
-    // 3) 再次加锁二次确认状态并真正入队
+    // 1) 在锁内完成可调度性检查与 ID 分配
+    // 2) 在锁外构造协程对象，缩短全局锁持有时长
+    // 3) 再次加锁写入对象表并入全局/本地队列
     CoroutineId id = 0;
-    std::size_t worker_index = 0;
+    bool enqueue_to_local = false;
+    std::size_t local_worker_index = 0;
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         if (!started_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire) || workers_.empty()) {
             throw std::logic_error("CoroutineScheduler::schedule requires started worker pool");
         }
 
         id = allocate_id();
-        // 轮询分发到不同 worker，降低热点队列冲突。
-        worker_index = dispatch_cursor_ % workers_.size();
-        ++dispatch_cursor_;
+        // 若调用方就在当前调度器的 worker 线程内，则优先走线程本地队列。
+        enqueue_to_local = (t_current_scheduler == this && t_current_worker_index < workers_.size());
+        if (enqueue_to_local) {
+            local_worker_index = t_current_worker_index;
+        }
     }
 
     // 协程对象构造放在大锁外，减少全局状态锁持有时间。
     auto coroutine = std::make_shared<Coroutine>(id, std::move(callback), stack_size);
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         // 二次检查：防止第一阶段通过后，调度器在并发 stop() 中发生状态变化。
         if (!started_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire) || workers_.empty()) {
             recycled_ids_.push_back(id);
@@ -55,16 +78,41 @@ CoroutineId CoroutineScheduler::schedule(CoroutineCallback callback, std::size_t
         }
 
         coroutines_.emplace(id, coroutine);
-        coroutine_last_worker_[id] = worker_index;
+        if (enqueue_to_local && local_worker_index < workers_.size()) {
+            coroutine_last_worker_[id] = local_worker_index;
+        } else {
+            const std::size_t hinted_worker = dispatch_cursor_ % workers_.size();
+            ++dispatch_cursor_;
+            coroutine_last_worker_[id] = hinted_worker;
+        }
         // pending 代表“已经入队但尚未被 worker 取走执行”的任务数。
         pending_tasks_.fetch_add(1, std::memory_order_relaxed);
 
-        WorkerContext& worker = *workers_[worker_index % workers_.size()];
-        {
-            std::lock_guard<std::mutex> worker_lock(worker.mutex);
-            worker.queue.push_back(id);
+        if (enqueue_to_local && local_worker_index < workers_.size()) {
+            WorkerContext& worker = *workers_[local_worker_index];
+            {
+                std::lock_guard<std::mutex> worker_lock(worker.mutex);
+                worker.local_queue.push_back(id);
+            }
+            enqueue_local_count_.fetch_add(1, std::memory_order_relaxed);
+            worker.cv.notify_one();
+            // 本地队列增长时唤醒其它 worker，便于触发工作窃取。
+            for (std::size_t i = 0; i < workers_.size(); ++i) {
+                if (i == local_worker_index) {
+                    continue;
+                }
+                workers_[i]->cv.notify_one();
+            }
+        } else {
+            {
+                std::lock_guard<std::mutex> global_lock(global_queue_mutex_);
+                global_queue_.push_back(id);
+            }
+            enqueue_global_count_.fetch_add(1, std::memory_order_relaxed);
+            for (auto& worker : workers_) {
+                worker->cv.notify_one();
+            }
         }
-        worker.cv.notify_one();
     }
 
     return id;
@@ -75,7 +123,7 @@ bool CoroutineScheduler::resume(CoroutineId id) {
     bool need_notify = false;
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         if (!started_.load(std::memory_order_acquire)
             || stop_requested_.load(std::memory_order_acquire)
             || workers_.empty()) {
@@ -121,9 +169,11 @@ bool CoroutineScheduler::resume(CoroutineId id) {
         WorkerContext& worker = *workers_[worker_index];
         {
             std::lock_guard<std::mutex> worker_lock(worker.mutex);
-            worker.queue.push_back(id);
+            // IO/WAITING 恢复路径进入本地快队列，优先于常规任务执行。
+            worker.local_fast_queue.push_back(id);
         }
         pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+        enqueue_fast_count_.fetch_add(1, std::memory_order_relaxed);
         target_worker = &worker;
         need_notify = true;
     }
@@ -139,7 +189,7 @@ void CoroutineScheduler::start(std::size_t worker_threads) {
     worker_threads = normalize_worker_threads(worker_threads);
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         // 已启动时直接返回，保持 start() 幂等。
         if (started_.load(std::memory_order_acquire)) {
             return;
@@ -147,6 +197,23 @@ void CoroutineScheduler::start(std::size_t worker_threads) {
         // 初始化状态，准备启动 worker 线程。
         stop_requested_.store(false, std::memory_order_release); // 确保 stop 标志重置，允许 start/stop 循环调用。
         workers_.clear();
+        {
+            std::lock_guard<std::mutex> global_lock(global_queue_mutex_);
+            global_queue_.clear();
+        }
+        pending_tasks_.store(0, std::memory_order_release);
+        active_tasks_.store(0, std::memory_order_release);
+        idle_switches_.store(0, std::memory_order_release);
+        steal_count_.store(0, std::memory_order_release);
+        enqueue_local_count_.store(0, std::memory_order_release);
+        enqueue_global_count_.store(0, std::memory_order_release);
+        enqueue_fast_count_.store(0, std::memory_order_release);
+        dequeue_local_fast_count_.store(0, std::memory_order_release);
+        dequeue_local_count_.store(0, std::memory_order_release);
+        dequeue_global_count_.store(0, std::memory_order_release);
+        dequeue_steal_count_.store(0, std::memory_order_release);
+        state_lock_wait_ns_total_.store(0, std::memory_order_release);
+        state_lock_wait_samples_.store(0, std::memory_order_release);
         // 预分配 WorkerContext，减少后续调度时的动态分配开销。
         workers_.reserve(worker_threads);
         for (std::size_t i = 0; i < worker_threads; ++i) {
@@ -178,7 +245,7 @@ void CoroutineScheduler::stop() {
 
     std::vector<std::thread> threads;
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         for (auto& worker : workers_) {
             worker->cv.notify_all();
             if (worker->thread.joinable()) {
@@ -195,9 +262,13 @@ void CoroutineScheduler::stop() {
     }
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         workers_.clear();
         dispatch_cursor_ = 0;
+    }
+    {
+        std::lock_guard<std::mutex> global_lock(global_queue_mutex_);
+        global_queue_.clear();
     }
 
     started_.store(false, std::memory_order_release);
@@ -219,7 +290,7 @@ void CoroutineScheduler::recycle_terminated() {
     std::vector<CoroutineId> pending_remove;
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         pending_remove.reserve(coroutines_.size());
         for (const auto& [id, coroutine] : coroutines_) {
             if (coroutine->state() == CoroutineState::TERM) {
@@ -258,6 +329,29 @@ std::size_t CoroutineScheduler::idle_switch_count() const noexcept {
     return idle_switches_.load(std::memory_order_acquire);
 }
 
+std::size_t CoroutineScheduler::steal_count() const noexcept {
+    return steal_count_.load(std::memory_order_acquire);
+}
+
+SchedulerProfileSnapshot CoroutineScheduler::profile_snapshot() const noexcept {
+    SchedulerProfileSnapshot snapshot;
+    snapshot.enqueue_local = enqueue_local_count_.load(std::memory_order_acquire);
+    snapshot.enqueue_global = enqueue_global_count_.load(std::memory_order_acquire);
+    snapshot.enqueue_fast = enqueue_fast_count_.load(std::memory_order_acquire);
+
+    snapshot.dequeue_local_fast = dequeue_local_fast_count_.load(std::memory_order_acquire);
+    snapshot.dequeue_local = dequeue_local_count_.load(std::memory_order_acquire);
+    snapshot.dequeue_global = dequeue_global_count_.load(std::memory_order_acquire);
+    snapshot.dequeue_steal = dequeue_steal_count_.load(std::memory_order_acquire);
+
+    snapshot.state_lock_wait_ns_total = state_lock_wait_ns_total_.load(std::memory_order_acquire);
+    snapshot.state_lock_wait_samples = state_lock_wait_samples_.load(std::memory_order_acquire);
+    snapshot.state_lock_wait_ns_avg = snapshot.state_lock_wait_samples == 0
+        ? 0
+        : (snapshot.state_lock_wait_ns_total / snapshot.state_lock_wait_samples);
+    return snapshot;
+}
+
 bool CoroutineScheduler::running() const noexcept {
     return started_.load(std::memory_order_acquire);
 }
@@ -277,7 +371,7 @@ CoroutineId CoroutineScheduler::allocate_id() {
 // 协程回收：将 ID 放回复用池，并从对象表中移除。
 void CoroutineScheduler::recycle(CoroutineId id) {
     // 协程对象生命周期由调度器统一收口。
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
     const auto it = coroutines_.find(id);
     if (it == coroutines_.end()) {
         return;
@@ -287,38 +381,39 @@ void CoroutineScheduler::recycle(CoroutineId id) {
     recycled_ids_.push_back(id);
     coroutine_last_worker_.erase(id);
     running_coroutines_.erase(id);
+    started_coroutines_.erase(id);
     pending_resumes_.erase(id);
     ++completed_count_;
 }
 
 void CoroutineScheduler::worker_loop(std::size_t worker_index) {
-    // 固定绑定到自己的 WorkerContext，避免每轮循环查询 workers_。
-    WorkerContext* worker = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (worker_index >= workers_.size()) {
-            return;
-        }
-        worker = workers_[worker_index].get();
+    if (worker_index >= workers_.size() || workers_[worker_index] == nullptr) {
+        return;
     }
+    // workers_ 在 start 后到 stop join 前不变更，可直接缓存本地引用，减少全局锁竞争。
+    WorkerContext& worker = *workers_[worker_index];
+
+    t_current_scheduler = this;
+    t_current_worker_index = worker_index;
 
     while (true) {
         CoroutineId id = 0;
-
-        {
-            std::unique_lock<std::mutex> lock(worker->mutex);
-            while (worker->queue.empty()) {
-                if (stop_requested_.load(std::memory_order_acquire)) {
-                    return;
-                }
-
-                // 空闲时执行小步等待，避免 busy spin；同时累加 idle 观测计数。
-                idle_switches_.fetch_add(1, std::memory_order_relaxed);
-                worker->cv.wait_for(lock, std::chrono::milliseconds(1));
+        if (!try_dequeue_next(worker_index, worker, id)) {
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                t_current_scheduler = nullptr;
+                t_current_worker_index = kInvalidWorkerIndex;
+                return;
             }
 
-            id = worker->queue.front();
-            worker->queue.pop_front();
+            // 空闲时执行小步等待，避免 busy spin；同时累加 idle 观测计数。
+            idle_switches_.fetch_add(1, std::memory_order_relaxed);
+            std::unique_lock<std::mutex> lock(worker.mutex);
+            worker.cv.wait_for(lock, std::chrono::milliseconds(1), [this, &worker]() {
+                return stop_requested_.load(std::memory_order_acquire)
+                    || !worker.local_fast_queue.empty()
+                    || !worker.local_queue.empty();
+            });
+            continue;
         }
 
         // 任务从队列出队，pending 对应减少。
@@ -327,11 +422,121 @@ void CoroutineScheduler::worker_loop(std::size_t worker_index) {
     }
 }
 
+bool CoroutineScheduler::try_dequeue_local_fast(WorkerContext& worker, CoroutineId& id) {
+    std::lock_guard<std::mutex> lock(worker.mutex);
+    if (!worker.local_fast_queue.empty()) {
+        id = worker.local_fast_queue.front();
+        worker.local_fast_queue.pop_front();
+        dequeue_local_fast_count_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+bool CoroutineScheduler::try_dequeue_local(WorkerContext& worker, CoroutineId& id) {
+    std::lock_guard<std::mutex> lock(worker.mutex);
+    if (!worker.local_queue.empty()) {
+        id = worker.local_queue.front();
+        worker.local_queue.pop_front();
+        dequeue_local_count_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+bool CoroutineScheduler::try_dequeue_global(CoroutineId& id) {
+    std::lock_guard<std::mutex> lock(global_queue_mutex_);
+    if (global_queue_.empty()) {
+        return false;
+    }
+    id = global_queue_.front();
+    global_queue_.pop_front();
+    dequeue_global_count_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool CoroutineScheduler::try_steal_from_other_worker(std::size_t thief_index, CoroutineId& id) {
+    if (workers_.size() <= 1 || thief_index >= workers_.size()) {
+        return false;
+    }
+
+    const auto try_steal_once = [&](bool require_rich_victim) -> bool {
+        for (std::size_t offset = 1; offset < workers_.size(); ++offset) {
+            const std::size_t victim_index = (thief_index + offset) % workers_.size();
+            WorkerContext* victim = workers_[victim_index].get();
+            if (victim == nullptr || victim == workers_[thief_index].get()) {
+                continue;
+            }
+
+            CoroutineId candidate = 0;
+            {
+                std::lock_guard<std::mutex> lock(victim->mutex);
+                if (victim->local_queue.empty()) {
+                    continue;
+                }
+                if (require_rich_victim && victim->local_queue.size() <= 1) {
+                    continue;
+                }
+
+                candidate = victim->local_queue.back();
+                victim->local_queue.pop_back();
+            }
+
+            bool started = false;
+            {
+                auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
+                started = started_coroutines_.find(candidate) != started_coroutines_.end();
+            }
+
+            if (started) {
+                // 已执行过的协程保持线程亲和，不参与窃取，避免跨线程恢复风险。
+                std::lock_guard<std::mutex> lock(victim->mutex);
+                victim->local_queue.push_back(candidate);
+                continue;
+            }
+
+            id = candidate;
+            steal_count_.fetch_add(1, std::memory_order_relaxed);
+            dequeue_steal_count_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    };
+
+    // 第一轮：优先从任务量较多的受害者偷取，避免把单任务 worker 直接掏空。
+    if (try_steal_once(true)) {
+        return true;
+    }
+
+    // 第二轮：若没有“富余受害者”，允许偷取单任务避免空转。
+    if (try_steal_once(false)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool CoroutineScheduler::try_dequeue_next(std::size_t worker_index, WorkerContext& worker, CoroutineId& id) {
+    if (try_dequeue_local_fast(worker, id)) {
+        return true;
+    }
+    if (try_dequeue_global(id)) {
+        return true;
+    }
+    if (try_dequeue_local(worker, id)) {
+        return true;
+    }
+    if (try_steal_from_other_worker(worker_index, id)) {
+        return true;
+    }
+    return try_dequeue_global(id);
+}
+
 void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_index) {
     // 先复制 shared_ptr，确保执行期间协程对象生命周期稳定。
     std::shared_ptr<Coroutine> coroutine;
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         const auto it = coroutines_.find(id);
         if (it == coroutines_.end()) {
             notify_idle_waiters();
@@ -340,6 +545,7 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
         coroutine = it->second;
         coroutine_last_worker_[id] = worker_index;
         running_coroutines_.insert(id);
+        started_coroutines_.insert(id);
     }
 
     if (coroutine->state() == CoroutineState::TERM) {
@@ -361,7 +567,7 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
         } else if (coroutine->state() == CoroutineState::WAITING) {
             bool should_resume_after_wait = false;
             {
-                std::lock_guard<std::mutex> lock(state_mutex_);
+                auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
                 const auto pending_it = pending_resumes_.find(id);
                 if (pending_it != pending_resumes_.end()) {
                     pending_resumes_.erase(pending_it);
@@ -382,7 +588,7 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
     }
 
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
         running_coroutines_.erase(id);
     }
 
@@ -397,7 +603,7 @@ void CoroutineScheduler::execute_coroutine(CoroutineId id, std::size_t worker_in
 }
 // 将 READY 状态的协程重新入队，供 worker 线程继续调度执行。
 void CoroutineScheduler::enqueue_ready(CoroutineId id, std::size_t worker_index) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto lock = timed_lock(state_mutex_, state_lock_wait_ns_total_, state_lock_wait_samples_);
     if (!started_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire) || workers_.empty()) {
         throw std::logic_error("CoroutineScheduler is stopping, cannot re-enqueue READY task");
     }
@@ -408,13 +614,14 @@ void CoroutineScheduler::enqueue_ready(CoroutineId id, std::size_t worker_index)
     }
     coroutine_last_worker_[id] = worker_index;
 
-    // 默认回投到当前 worker，尽量保持执行局部性。
+    // yield 续跑回投到线程本地普通队列；快队列只留给 WAITING->READY 恢复。
     WorkerContext& worker = *workers_[worker_index];
     {
         std::lock_guard<std::mutex> worker_lock(worker.mutex);
-        worker.queue.push_back(id);
+        worker.local_queue.push_back(id);
     }
     pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+    enqueue_local_count_.fetch_add(1, std::memory_order_relaxed);
     worker.cv.notify_one();
 }
 

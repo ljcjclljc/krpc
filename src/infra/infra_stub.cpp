@@ -37,9 +37,32 @@ ConfigSnapshot default_bootstrap_snapshot() {
     ConfigSnapshot snapshot;
     snapshot.version = 1;
     snapshot.values.emplace("rpc.timeout_ms", "200");
+    snapshot.values.emplace("rpc.retry.max_retries", "1");
+    snapshot.values.emplace("rpc.retry.window_ms", "1000");
+    snapshot.values.emplace("rpc.retry.ratio", "0.2");
+    snapshot.values.emplace("rpc.retry.min_tokens", "1");
     snapshot.values.emplace("rpc.retry_budget_ratio", "0.2");
+    snapshot.values.emplace("rpc.circuit.failure_threshold", "3");
+    snapshot.values.emplace("rpc.circuit.open_ms", "280");
+    snapshot.values.emplace("rpc.circuit.half_open_success", "2");
+    snapshot.values.emplace("rpc.circuit.half_open_max_probes", "1");
+    snapshot.values.emplace("rpc.lb.weight.cpu", "0.30");
+    snapshot.values.emplace("rpc.lb.weight.mem", "0.20");
+    snapshot.values.emplace("rpc.lb.weight.qps", "0.20");
+    snapshot.values.emplace("rpc.lb.weight.latency", "0.30");
+    snapshot.values.emplace("rpc.lb.target_qps", "220");
+    snapshot.values.emplace("rpc.lb.target_latency_ms", "80");
+    snapshot.values.emplace("rpc.gray.percent", "0");
     snapshot.values.emplace("gateway.queue.max_size", "4096");
     snapshot.values.emplace("gateway.rate_limit.qps", "10000");
+    snapshot.values.emplace("gateway.rate_limit.burst", "2000");
+    snapshot.values.emplace("net.tls.enabled", "0");
+    snapshot.values.emplace("net.tls.mtls.enabled", "0");
+    snapshot.values.emplace("net.tls.insecure_skip_verify", "0");
+    snapshot.values.emplace("net.tls.ca_file", "");
+    snapshot.values.emplace("net.tls.cert_file", "");
+    snapshot.values.emplace("net.tls.key_file", "");
+    snapshot.values.emplace("net.tls.server_name", "");
     return snapshot;
 }
 
@@ -148,6 +171,49 @@ bool refresh_config_from_center() {
 
     // 仅当版本更新时才会实际生效。
     return g_repository->update_if_newer(*latest);
+}
+
+bool publish_config_snapshot(const ConfigSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_repository) {
+        return false;
+    }
+    return g_repository->update_if_newer(snapshot);
+}
+
+bool publish_config_patch(const ConfigMap& patch, std::uint64_t* applied_version) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_repository) {
+        return false;
+    }
+
+    ConfigSnapshot next = g_repository->snapshot();
+    for (const auto& entry : patch) {
+        next.values[entry.first] = entry.second;
+    }
+    next.version = next.version + 1;
+
+    const bool applied = g_repository->update_if_newer(next);
+    if (applied && applied_version != nullptr) {
+        *applied_version = next.version;
+    }
+    return applied;
+}
+
+bool rollback_config_to(std::uint64_t version) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_repository) {
+        return false;
+    }
+    return g_repository->rollback_to(version);
+}
+
+std::uint64_t current_config_version() {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_repository) {
+        return 0;
+    }
+    return g_repository->snapshot().version;
 }
 
 const ConfigRepository& config_repository() {
